@@ -1,125 +1,135 @@
-require('dotenv').config();
-const express = require('express');
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const cors = require('cors');
+require("dotenv").config();
+const { Client, GatewayIntentBits, InteractionType } = require("discord.js");
+const admin = require("firebase-admin");
+const express = require("express");
+const DiscordDMService = require("./discordDMService");
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+// Firebase Admin SDK 초기화
+const firebaseServiceAccountKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+if (!firebaseServiceAccountKey) {
+    console.error("FIREBASE_SERVICE_ACCOUNT_KEY 환경 변수가 설정되지 않았습니다.");
+    process.exit(1);
+}
 
-// Discord 봇 클라이언트 설정
+try {
+    const serviceAccount = JSON.parse(firebaseServiceAccountKey);
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: process.env.FIREBASE_DATABASE_URL
+    });
+    console.log("Firebase Admin SDK 초기화 완료");
+} catch (error) {
+    console.error("Firebase 서비스 계정 키 파싱 오류:", error);
+    process.exit(1);
+}
+
+const db = admin.database();
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers, // check-membership을 위해 필요
-    ],
-    partials: [Partials.Channel, Partials.Message],
+        GatewayIntentBits.GuildMembers, // For fetching user info if needed
+        GatewayIntentBits.MessageContent, // Required for message.content
+    ]
 });
 
-// 미들웨어 설정
-app.use(cors());
-app.use(express.json());
+const discordDMService = new DiscordDMService(client, db);
 
-// 봇 준비 완료 시
-client.once('ready', () => {
-    console.log(`Discord 봇 로그인 완료! ${client.user.tag}으로 로그인됨.`);
+client.once("ready", () => {
+    console.log(`Logged in as ${client.user.tag}!`);
 });
 
-// Discord API 토큰으로 로그인
+client.on("messageCreate", async message => {
+    if (message.author.bot) return;
+
+    if (message.content === "!ping") {
+        message.reply("Pong!");
+    }
+});
+
+client.on("interactionCreate", async interaction => {
+    if (!interaction.isButton()) return;
+
+    const [action, ticketId] = interaction.customId.split("_");
+
+    if (action === "close" && ticketId) {
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            // 티켓 정보를 Firebase에서 가져와야 합니다.
+            const ticketRef = db.ref(`tickets/${ticketId}`);
+            const ticketSnapshot = await ticketRef.once("value");
+            const ticket = ticketSnapshot.val();
+
+            if (!ticket) {
+                await interaction.editReply("해당 티켓을 찾을 수 없습니다.");
+                return;
+            }
+
+            // 상호작용을 한 사용자가 티켓 작성자이거나 관리자인지 확인
+            const userRef = db.ref(`users/${interaction.user.id}`);
+            const userSnapshot = await userRef.once("value");
+            const userData = userSnapshot.val();
+
+            const isAdmin = userData && userData.isAdmin;
+            const isCreator = ticket.creatorId === interaction.user.id;
+
+            if (!isAdmin && !isCreator) {
+                await interaction.editReply("이 티켓을 닫을 권한이 없습니다.");
+                return;
+            }
+
+            // 티켓 상태를 'closed'로 변경
+            await ticketRef.update({ status: "closed" });
+            await discordDMService.onTicketStatusChanged(ticketId, "closed", ticket, ticket.siteId); // siteId는 티켓 객체에 포함되어야 함
+
+            await interaction.editReply(`티켓 **${ticketId}**가 성공적으로 닫혔습니다.`);
+        } catch (error) {
+            console.error("티켓 닫기 처리 중 오류 발생:", error);
+            await interaction.editReply("티켓을 닫는 중 오류가 발생했습니다.");
+        }
+    }
+});
+
 client.login(process.env.DISCORD_BOT_TOKEN);
 
-// ============================================================
-// API 엔드포인트
-// ============================================================
+// Express 서버 설정 (웹 애플리케이션에서 이벤트를 수신하기 위함)
+const app = express();
+app.use(express.json());
 
-// 봇 서버 멤버십 확인 엔드포인트
-app.get('/api/check-membership', async (req, res) => {
-    const userId = req.query.userId;
-    if (!userId) {
-        return res.status(400).json({ success: false, message: 'userId가 필요합니다.' });
-    }
+app.post("/webhook/ticket", async (req, res) => {
+    const { eventType, ticket, ticketMode, creatorDiscordId, siteId, authorName, content, isAdminSender, newStatus, ticketTitle } = req.body;
 
     try {
-        // 봇이 참여하고 있는 모든 서버를 순회하며 멤버십 확인
-        let isMember = false;
-        for (const guild of client.guilds.cache.values()) {
-            try {
-                await guild.members.fetch(userId);
-                isMember = true;
-                break; // 멤버를 찾았으면 더 이상 검색할 필요 없음
-            } catch (error) {
-                // 해당 서버에 유저가 없거나 접근 권한이 없는 경우
-                continue;
-            }
+        switch (eventType) {
+            case "ticketCreated":
+                await discordDMService.onTicketCreated(ticket, ticketMode, creatorDiscordId, siteId);
+                break;
+            case "chatMessage":
+                await discordDMService.sendChatDM(ticket.id, ticket, authorName, content, isAdminSender, creatorDiscordId, siteId);
+                break;
+            case "ticketStatusChanged":
+                await discordDMService.onTicketStatusChanged(ticket.id, newStatus, ticket, siteId);
+                break;
+            case "ticketDeleted":
+                await discordDMService.onTicketDeleted(ticket.id, ticketTitle, siteId);
+                break;
+            case "inquiryAnswered":
+                await discordDMService.onInquiryAnswered(ticket.id, ticket, siteId);
+                break;
+            default:
+                console.warn("알 수 없는 이벤트 타입:", eventType);
         }
-
-        if (isMember) {
-            res.json({ success: true, message: '사용자가 봇이 있는 서버에 속해 있습니다.' });
-        } else {
-            res.json({ success: false, message: '사용자가 봇이 있는 서버에 속해 있지 않습니다.' });
-        }
+        res.status(200).send("Event processed");
     } catch (error) {
-        console.error('멤버십 확인 중 오류 발생:', error);
-        res.status(500).json({ success: false, message: '서버 오류가 발생했습니다.' });
+        console.error("Webhook 처리 중 오류 발생:", error);
+        res.status(500).send("Error processing event");
     }
 });
 
-// 디스코드 알림 전송 엔드포인트
-app.post('/api/discord/notify', async (req, res) => {
-    const { ticket, userId } = req.body;
-
-    if (!ticket || !userId) {
-        return res.status(400).json({ success: false, message: 'ticket 및 userId가 필요합니다.' });
-    }
-
-    try {
-        const user = await client.users.fetch(userId);
-        if (!user) {
-            return res.status(404).json({ success: false, message: '해당 Discord 사용자를 찾을 수 없습니다.' });
-        }
-
-        const ticketUrl = `http://https://ticketbotdiscord.netlify.app/ticket.html?site=${ticket.siteId || 'default'}&ticket=${ticket.id}`;
-        // 실제 배포 시에는 `BOT_SERVER_URL` 대신 실제 프론트엔드 URL을 사용해야 합니다.
-
-        const embed = new EmbedBuilder()
-            .setColor(0x5865F2) // Discord Blurple
-            .setTitle(`🎫 새 티켓: ${ticket.title}`)
-            .setDescription(ticket.content.length > 400 ? ticket.content.substring(0, 397) + '...' : ticket.content)
-            .addFields(
-                { name: '📌 ID', value: `\`${ticket.id}\``, inline: true },
-                { name: '📂 카테고리', value: ticket.category || '미지정', inline: true },
-                { name: '📊 우선순위', value: ticket.priority || '미지정', inline: true },
-                { name: '👤 작성자', value: ticket.creatorName || '알 수 없음', inline: true }
-            )
-            .setTimestamp()
-            .setFooter({ text: `티켓 시스템 • ${ticket.id}` });
-
-        const row = new ActionRowBuilder()
-            .addComponents(
-                new ButtonBuilder()
-                    .setLabel('웹사이트에서 보기')
-                    .setStyle(ButtonStyle.Link)
-                    .setURL(ticketUrl),
-            );
-
-        await user.send({ embeds: [embed], components: [row] });
-        console.log(`Discord 사용자 ${user.tag}에게 티켓 알림 전송 완료: ${ticket.id}`);
-        res.json({ success: true, message: '알림이 성공적으로 전송되었습니다.' });
-
-    } catch (error) {
-        console.error('Discord 알림 전송 중 오류 발생:', error);
-        res.status(500).json({ success: false, message: '알림 전송에 실패했습니다.' });
-    }
-});
-
-// 서버 시작
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Express 서버가 ${PORT} 포트에서 실행 중입니다.`);
-});
-
-// 에러 핸들링
-process.on('unhandledRejection', error => {
-    console.error('Unhandled promise rejection:', error);
+    console.log(`Webhook server listening on port ${PORT}`);
 });
